@@ -3,18 +3,38 @@ import socket
 import threading
 import sys
 import json
+import uuid
+from cryptography.hazmat.primitives import serialization
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 9009
 
 clients_lock = threading.Lock()
-clients = {}  # username -> socket
+
+def load_public_keys():
+    public_keys = {}
+
+    for username in ["Alice", "Bob"]:
+        with open(f"keys/{username}_public.pem", "rb") as f:
+            public_keys[username] = serialization.load_pem_public_key(
+                f.read()
+            )
+
+    return public_keys
+
+users = {}             # user_id -> user information
+username_to_id = {}    # username -> user_id
+public_keys = load_public_keys()
+
+
 
 def handle_client(conn, addr):
     username = None
+    user_id = None
+    registered = False
     buffer = b""
     try:
-        # --- Registration ---
+        #region Registration
         while b'\n' not in buffer:
             chunk = conn.recv(1024)
             if not chunk:
@@ -24,94 +44,151 @@ def handle_client(conn, addr):
         line, buffer = buffer.split(b'\n', 1)
         line = line.decode('utf-8', errors='replace')
         msg = json.loads(line)
+        #region Authentication
 
-        username = msg.get("sender")
+
+        if msg.get("type") != "AUTH_REQUEST":
+            conn.sendall(json.dumps({
+                "type": "AUTH_FAILURE",
+                "reason": "Expected authentication request"
+            }).encode() + b"\n")
+            conn.close()
+            return
+
+        username = msg.get("user_id")
+        request_id = msg.get("request_id")
+
+        if not username or not request_id:
+            conn.sendall(json.dumps({
+                "type": "AUTH_FAILURE",
+                "reason": "Missing UserID or Request ID"
+            }).encode() + b"\n")
+            conn.close()
+            return
+
         if not username:
-            conn.sendall(json.dumps({"status": 0, "reason": "No Username Given"}).encode() + b"\n")
+            conn.sendall(json.dumps({
+                "type": "REGISTER_RESPONSE",
+                "success": False,
+                "reason": "No username given"
+            }).encode() + b"\n")
+            conn.close()
+            return
+        if username not in public_keys:
+            conn.sendall(json.dumps({
+                "type": "REGISTER_RESPONSE",
+                "success": False,
+                "reason": "Unknown username"
+            }).encode() + b"\n")
             conn.close()
             return
 
         with clients_lock:
-            if username in clients:
-                conn.sendall(json.dumps({"status": 0}, "reason", "Username Taken").encode() + b"\n")
+            if username in username_to_id:
+                conn.sendall(json.dumps({
+                    "type": "REGISTER_RESPONSE",
+                    "success": False,
+                    "reason": "Username taken"
+                }).encode() + b"\n")
                 conn.close()
                 return
-            clients[username] = conn
 
-        conn.sendall(json.dumps({"status": 1}).encode() + b"\n")
-        print(f"Add new client: {username}")
-        print(clients)
+            user_id = uuid.uuid4().hex
 
-        # --- Messages ---
+            users[user_id] = {
+                "username": username,
+                "connection": conn,
+                "address": addr,
+                "available": True,
+                "active_session": None
+            }
+
+            username_to_id[username] = user_id
+            registered = True
+
+        conn.sendall(json.dumps({
+            "type": "AUTH_REQUEST_RECEIVED",
+            "request_id": request_id,
+            "user_id": user_id
+        }).encode() + b"\n")
+
+        print(f"[*] Registered {username} with ID {user_id}")
+
+        # endregion
+        #endregion
+
+
         while True:
-            chunk = conn.recv(1024)
-            if not chunk:
+            data = conn.recv(1024)
+
+            if not data:
                 break
-            buffer += chunk
-            while b'\n' in buffer:
-                line, buffer = buffer.split(b'\n', 1)
-                line = line.decode('utf-8', errors='replace')
-                msg = json.loads(line)
 
+            # We will handle protocol messages here later.
+            print(f"[!] Received data from {username}: {data}")
 
-                sender = msg.get("sender")
-                recipient = msg.get("receiver")
-                with clients_lock:
-                    fromDest = clients.get(sender)
-                    dest = clients.get(recipient)
-                if dest and fromDest:
-                    forward = msg
-                    try:
-                        dest.sendall(json.dumps(forward).encode() + b'\n')
-                        print(f"Send from: {sender} to: {recipient}")
-                    except Exception:
-                        # remove disconnected client
-                        with clients_lock:
-                            if recipient in clients and clients[recipient] is dest:
-                                try:
-                                    clients[recipient].close()
-                                except:
-                                    pass
-                                del clients[recipient]
-                
-                else:
-                    err = {"status": "ERR", "error": f"No connected client named {recipient}"}
-                    conn.sendall(json.dumps(err).encode() + b'\n')
+        
 
     except Exception as e:
         print(f"[!] Exception for {addr}: {e}")
     finally:
-        if username:
+        if registered:
             with clients_lock:
-                if username in clients and clients[username] is conn:
-                    del clients[username]
+                if user_id in users and users[user_id]["connection"] is conn:
+                    del users[user_id]
+                    del username_to_id[username]
+
             print(f"[-] {username} disconnected")
+
         try:
             conn.close()
-        except:
+        except OSError:
             pass
 
 def start_server():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.settimeout(1.0)
     s.bind((HOST, PORT))
     s.listen(50)
+
     print(f"[+] Server listening on {HOST}:{PORT}")
+
     try:
         while True:
-            conn, addr = s.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            try:
+                conn, addr = s.accept()
+
+                threading.Thread(
+                    target=handle_client,
+                    args=(conn, addr),
+                    daemon=True
+                ).start()
+
+            except socket.timeout:
+                continue
+
     except KeyboardInterrupt:
         print("\n[!] Shutting down server.")
+
     finally:
         with clients_lock:
-            for u, c in list(clients.items()):
+            for user_id, user in list(users.items()):
                 try:
-                    c.close()
-                except:
+                    user["connection"].shutdown(socket.SHUT_RDWR)
+                except OSError:
                     pass
-            clients.clear()
+
+                try:
+                    user["connection"].close()
+                except OSError:
+                    pass
+
+            users.clear()
+            username_to_id.clear()
+
         s.close()
+        print("[+] Server shut down.")
 
 if __name__ == "__main__":
     start_server()

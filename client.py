@@ -4,6 +4,7 @@ import select
 import sys
 import threading
 import json
+import uuid
 
 
 USERNAME = input("input you username:")
@@ -27,7 +28,7 @@ def output_thread(sock):
                 if(msg.get("status") != 1):
                     print(msg.get("error"))
                     continue
-                print(f"<{msg.get("sender")}>: {msg.get("text")}")
+                print(f"<{msg.get('sender')}>: {msg.get('text')}")
 
     except Exception as e:
         print(f"[!] Receiver error: {e}")
@@ -42,76 +43,98 @@ def output_thread(sock):
 
 def input_thread(sock):
     while True:
-        if sys.platform == "win32":
-            import msvcrt
-            if msvcrt.kbhit():
-                line = sys.stdin.readline().rstrip("\n")
-            else:
-                line = None
-        else:
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if rlist:
-                line = rlist[0].readline().rstrip("\n")  
-            else: 
-                None
-        if not line:
-            continue
-        # split into recipient and message
-        parts = line.split(':', 1)
-        if len(parts) < 2:
-            print("Usage: <recipient_username>:<message>")
-            continue
-        recipient = parts[0].strip()
-        message = parts[1]
-        msg = {"status": 1, "sender": USERNAME, "receiver": recipient, "text": message}
         try:
+            line = input()
+
+            if not line:
+                continue
+
+            parts = line.split(':', 1)
+
+            if len(parts) < 2:
+                print("Usage: <recipient_username>:<message>")
+                continue
+
+            recipient = parts[0].strip()
+            message = parts[1]
+
+            msg = {
+                "status": 1,
+                "sender": USERNAME,
+                "receiver": recipient,
+                "text": message
+            }
+
             sock.sendall(json.dumps(msg).encode() + b'\n')
-        except Exception:
+
+        except (EOFError, KeyboardInterrupt):
+            break
+        except OSError:
             print("[!] Failed to send (server may have disconnected).")
             break
 
 
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((HOST, PORT))
 
-    # Register
-    msg = {"status": 0, "sender": USERNAME}
-    reg_line = json.dumps(msg).encode() + b'\n'
-    sock.sendall(reg_line)
+    try:
+        sock.connect((HOST, PORT))
 
-    data = b""
-    while b'\n' not in data:
-        chunk = sock.recv(1024)
-        if not chunk:
-            print("[!] Connection closed before registration response")
-            sock.close()
+        # Authenticate
+        request_id = uuid.uuid4().hex
+
+        msg = {
+            "type": "AUTH_REQUEST",
+            "user_id": USERNAME,
+            "request_id": request_id
+        }
+        sock.sendall(json.dumps(msg).encode() + b'\n')
+
+        data = b""
+        while b'\n' not in data:
+            chunk = sock.recv(1024)
+            if not chunk:
+                print("[!] Connection closed before registration response")
+                return
+            data += chunk
+
+        first_line, rest = data.split(b'\n', 1)
+        response = json.loads(first_line.decode('utf-8'))
+
+        if (
+            response.get("type") == "AUTH_REQUEST_RECEIVED"
+            and response.get("request_id") == request_id
+        ):
+            print("[*] Authentication request received by server.")
+        else:
+            print("[!] Unexpected response:", response)
             return
-        data += chunk
 
-    
-    first_line, rest = data.split(b'\n', 1)
-    first_line = first_line.decode('utf-8', errors='replace')
+        # Start receiver thread
+        t_out = threading.Thread(
+            target=output_thread,
+            args=(sock,),
+            daemon=True
+        )
+        t_out.start()
 
-    line = json.loads(first_line)
-    if line.get("status") == 1:
-        print("[*] Registered successfully.")
-    elif line.get("status") == 0:
-        print("[!] Registration error:" + line.get("reason"))
+        # Run input in main thread
+        input_thread(sock)
+
+    except KeyboardInterrupt:
+        print("\n[!] Disconnecting...")
+
+    except Exception as e:
+        print(f"[!] Client error: {e}")
+
+    finally:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
         sock.close()
-        return
-    else:
-        print("[!] Unexpected response:", line)
-        sock.close()
-        return
-
-    t_out = threading.Thread(target=output_thread, args=(sock,))
-    t_in = threading.Thread(target=input_thread, args=(sock,))
-    t_out.start()
-    t_in.start()
-
-    t_in.join()
-    sock.close()
+        print("[*] Client shut down.")
 
 
 if __name__ == "__main__":
